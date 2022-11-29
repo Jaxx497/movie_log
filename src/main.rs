@@ -1,15 +1,16 @@
+use csv;
+use serde::Serialize;
 use std::path::PathBuf;
 use walkdir::WalkDir;
-use matroska::Matroska;
-use matroska::Settings::Video;
-use matroska::Settings::Audio;
-// use polars::prelude::*;
+use std::error::Error;
+use matroska::{Matroska, Settings::{Video, Audio}};
+use polars::prelude::*;
 
-#[derive(Debug)]
-struct Movie <'a> {
+#[derive(Debug, Serialize)]
+pub struct Movie <'a> {
     title: &'a str,
     year: i16,
-    size: f32,
+    size: String,
     duration: String,
     res: &'a str,
     bit_depth: &'a str,
@@ -32,23 +33,38 @@ fn main() {
         }
     }
 
-    // ! Use to generate a placeholder matroska type
+    // Create CSV from all movies
+    if let Err(e) = get_csv(&directories) {
+        eprintln!("{}", e)
+    }
+
+    let df = std::fs::File::open("D:/Movies/output.csv").expect("Could not open file");
+
+    let z = CsvReader::new(df)
+        .infer_schema(None)
+        .has_header(true)
+        .finish();
+
+    println!("{:?}", z);
+    // ! Use to generate an example matroska type
     // let f = std::fs::File::open(&directories[99]).unwrap();
     // let matroska = Matroska::open(&f).unwrap();
     // println!("{:?}", matroska);
 
-    // Parse info
-    let movie_info = parse(&directories);
-
-    for movie in movie_info.iter() {
-        println!("{}, {}, {}, {:.3}, {}, {}, {}, {}, {:.1}", movie.title, movie.year, movie.duration, movie.size, movie.res, movie.bit_depth, movie.v_codec, movie.a_codec, movie.channels);
-    }
-    // Create dataframe
-
 }
 
-fn parse(directories: &Vec<PathBuf>) -> Vec<Movie> {
-    let mut movie_info = Vec::new();
+// fn get_df() -> Result<DataFrame> {
+//     let file = std::fs::File::open("D:/output.csv").expect("Could not open file");
+
+//     CsvReader::new(file)
+//         .infer_schema(None)
+//         .has_header(true)
+//         .finish()
+// }
+
+fn get_csv(directories: &Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+
+    let mut writer = csv::Writer::from_path("D:/Movies/output.csv")?;
     for item in directories.iter() {
 
         let f = std::fs::File::open(item).unwrap();
@@ -90,7 +106,7 @@ fn parse(directories: &Vec<PathBuf>) -> Vec<Movie> {
             "V_MPEG4/ISO/AVC" => ("x264", "8bit"),
             _ => ("XXXXXXXXXX", "XXXXXXXXXX")
         };
-    
+
     // ? AUDIO METADATA
         // Audio codec
         let aud_info = &matroska.tracks[1];
@@ -114,6 +130,107 @@ fn parse(directories: &Vec<PathBuf>) -> Vec<Movie> {
             Audio(c) if c.channels == 0 => 1.0,
             _ => 9.9,
         };
+
+        writer.serialize(Movie {
+            title, year, size, duration, res, bit_depth, v_codec, a_codec, channels,
+        })?;
+    }
+
+    writer.flush()?;
+
+    Ok(())
+}
+
+fn get_dur(x: std::time::Duration) -> String {
+    // let seconds = x.as_secs() % 60;   
+    let minutes = (x.as_secs() / 60) % 60;
+    let hours = (x.as_secs() / 60) / 60;
+    
+    format!("{}h {:02}min", hours, minutes)
+}
+
+fn human_readable(mut bytes: f32) -> String {
+    for _i in ["B", "KB", "MB", "GB"] {
+        if bytes < 1024.0 {
+            break
+        }
+        bytes /= 1024.0;
+    }
+    format!("{:.2}", bytes)
+}
+
+// ? OLD PARSING FUNCTION
+// ?     Very similar to get_csv but returns vec<Movie>
+// let movie_info = parse(&directories);
+/* 
+fn parse(directories: &Vec<PathBuf>) -> Vec<Movie> {
+    
+    let mut movie_info = Vec::new();
+    for item in directories.iter() {
+        
+        let f = std::fs::File::open(item).unwrap();
+        let matroska = Matroska::open(&f).unwrap();
+        
+        // ? GENERAL METADATA
+        // Title
+        let file_title = item.to_str().unwrap();
+        let paren1 = &file_title.find("(").unwrap();
+        let title = &file_title[3..*paren1-1];
+        
+        // Year
+        let paren2 = &file_title.find(")").unwrap();
+        let year_str = &file_title[*paren1+1..*paren2];
+        let year = year_str.parse::<i16>().unwrap();
+        
+        // Size    » API returns number of bytes, must be converted
+        let byte_count = std::fs::metadata(item).unwrap().len();
+        let size = human_readable(byte_count as f32);
+        
+        // Duration
+        let dur_secs = matroska.info.duration.unwrap();
+        let duration = get_dur(dur_secs);
+        
+        // ? VIDEO METADATA            
+        
+        let vid_info = &matroska.tracks[0];
+        
+        // Resolution
+        let res = match &vid_info.settings {
+            Video(n) if n.pixel_width > 1920 => "2160p",
+            Video(n) if n.pixel_width <= 1920 => "1080p",
+            _ => "9999p",
+        };
+        
+        // Video Codec & Bit depth
+        let (v_codec, bit_depth) = match vid_info.codec_id.as_str() {
+            "V_MPEGH/ISO/HEVC" => ("x265", "10bit"),
+            "V_MPEG4/ISO/AVC" => ("x264", "8bit"),
+            _ => ("XXXXXXXXXX", "XXXXXXXXXX")
+        };
+        
+        // ? AUDIO METADATA
+        // Audio codec
+        let aud_info = &matroska.tracks[1];
+        
+        let a_codec = match aud_info.codec_id.as_str() {
+            "A_AAC" => "AAC",
+            "A_AC3" => "AC3",
+            "A_EAC3" => "EAC3",
+            "A_DTS" => "DTS",
+            "A_TRUEHD" => "TrueHD Atmos",
+            _ => "XXX",
+        };
+        
+        // Audio Channels
+        let channels: f32 = match &aud_info.settings {
+            Audio(c) if c.channels == 8 => 7.1,
+            Audio(c) if c.channels == 7 => 6.1,
+            Audio(c) if c.channels == 6 => 5.1,
+            Audio(c) if c.channels == 4 => 4.0,
+            Audio(c) if c.channels == 2 => 2.0,
+            Audio(c) if c.channels == 0 => 1.0,
+            _ => 9.9,
+        };
         
         movie_info.push(Movie {
             title, year, size, duration, res, bit_depth, v_codec, a_codec, channels,
@@ -122,20 +239,4 @@ fn parse(directories: &Vec<PathBuf>) -> Vec<Movie> {
     movie_info
 }
 
-fn get_dur(x: std::time::Duration) -> String {
-    // let seconds = x.as_secs() % 60;   
-    let minutes = (x.as_secs() / 60) % 60;
-    let hours = (x.as_secs() / 60) / 60;
-
-    format!("{}h {:02}min", hours, minutes)
-}
-
-fn human_readable(mut bytes: f32) -> f32 {
-    for _i in ["B", "KB", "MB", "GB"] {
-        if bytes < 1024.0 {
-            break
-        }
-        bytes /= 1024.0;
-    }
-    bytes
-}
+*/
