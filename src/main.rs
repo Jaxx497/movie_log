@@ -2,9 +2,7 @@ use csv;
 use serde::Serialize;
 use std::path::PathBuf;
 use walkdir::WalkDir;
-use std::error::Error;
 use matroska::{Matroska, Settings::{Video, Audio}};
-use polars::prelude::*;
 
 #[derive(Debug, Serialize)]
 pub struct Movie <'a> {
@@ -17,9 +15,14 @@ pub struct Movie <'a> {
     v_codec: &'a str,
     a_codec: &'a str,
     channels: f32,
+    encoder: &'a str,
+    remux: bool,
 }
 
 fn main() {
+
+    let start = std::time::Instant::now();
+    
     // Create a vector of all .mkv files at depth=2
     let mut directories = Vec::new();
 
@@ -38,33 +41,23 @@ fn main() {
         eprintln!("{}", e)
     }
 
-    let df = std::fs::File::open("D:/Movies/output.csv").expect("Could not open file");
+    let total_time = start.elapsed();
+    println!("\nSuccessfully logged {} movies and exported to movie_log.csv in {:.4?}.", directories.len(), total_time);
 
-    let z = CsvReader::new(df)
-        .infer_schema(None)
-        .has_header(true)
-        .finish();
-
-    println!("{:?}", z);
     // ! Use to generate an example matroska type
     // let f = std::fs::File::open(&directories[99]).unwrap();
     // let matroska = Matroska::open(&f).unwrap();
     // println!("{:?}", matroska);
 
+    // Press Enter to quit
+    println!("Press Enter to exit...");
+    std::io::stdin().read_line(&mut String::new()).unwrap();
+
 }
 
-// fn get_df() -> Result<DataFrame> {
-//     let file = std::fs::File::open("D:/output.csv").expect("Could not open file");
+fn get_csv(directories: &Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
 
-//     CsvReader::new(file)
-//         .infer_schema(None)
-//         .has_header(true)
-//         .finish()
-// }
-
-fn get_csv(directories: &Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
-
-    let mut writer = csv::Writer::from_path("D:/Movies/output.csv")?;
+    let mut writer = csv::Writer::from_path("D:/Movies/movie_log.csv")?;
     for item in directories.iter() {
 
         let f = std::fs::File::open(item).unwrap();
@@ -80,6 +73,16 @@ fn get_csv(directories: &Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
         let paren2 = &file_title.find(")").unwrap();
         let year_str = &file_title[*paren1+1..*paren2];
         let year = year_str.parse::<i16>().unwrap();
+
+        //Encoder & Remux
+        let has_encoder = get_encoder(&file_title);
+        let encoder = match has_encoder {
+            Some(enc) => enc,
+            None => "None"
+        };
+
+        let remux = file_title.to_lowercase().contains("remux");
+        println!("{}", remux);
 
         // Size    » API returns number of bytes, must be converted
         let byte_count = std::fs::metadata(item).unwrap().len();
@@ -132,13 +135,26 @@ fn get_csv(directories: &Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
         };
 
         writer.serialize(Movie {
-            title, year, size, duration, res, bit_depth, v_codec, a_codec, channels,
+            title, year, size, duration, res, bit_depth, v_codec, a_codec, channels, encoder, remux
         })?;
+
+        // println!("Successfully finished logging {}", title);
     }
 
     writer.flush()?;
 
     Ok(())
+}
+
+fn get_encoder(title: &str) -> Option<&str> {
+    let enc_list = ["Tigole", "FraMeSToR", "Silence", "afm72", "DDR", "Bandi", "SAMPA", "3xO", "Joy", "RARBG", "SARTRE", "PHOCiS", "TERMiNAL", "PSA", "K1tKat", "FreetheFish", "Natty", "IchtyFinger", "BeiTai", "LEGi0N", "HDH", "HANDS", "GREENOTEA", "IWFM", "FRDS", "Ritaj", "Enthwar", "t3nzin", "EDG"];
+
+    for enc in enc_list{
+        if title.contains(enc){
+            return Some(enc);
+        }
+    }
+    None
 }
 
 fn get_dur(x: std::time::Duration) -> String {
