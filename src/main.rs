@@ -1,16 +1,23 @@
-#![allow(unused_imports)]
 use csv;
 use reqwest;
 use matroska::{
     Matroska,
     Settings::{Audio, Video},
 };
+use kdam::{tqdm, BarExt};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use walkdir::WalkDir;
 use select::document::Document;
 use select::predicate::{Class, Attr};
 use std::collections::HashMap;
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    main_path: String,
+    letterboxd: String,
+    enc_list: Vec<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -41,23 +48,22 @@ impl<T1: Copy + Into<String>, T2: Copy + Into<String>> TupleToStrings for (T1, T
 
 fn main() {
     let timer = std::time::Instant::now();
-    
-    // Create a vector of all .mkv files at depth=2
+    let config = cfg_init();
     let mut directories = Vec::new();
-    
-    let parent_dir = "M:/";
-    for entry in WalkDir::new(parent_dir)
+
+    // Create a vector of all .mkv files at depth=2
+    for entry in WalkDir::new(&config.main_path)
         .max_depth(2)
         .into_iter()
         .filter_map(|file| file.ok())
-    {
-        if entry.file_name().to_string_lossy().ends_with(".mkv") {
-            directories.push(entry.path().to_owned());
+        {
+            if entry.file_name().to_string_lossy().ends_with(".mkv") {
+                directories.push(entry.path().to_owned());
+            }
         }
-    }
 
     // Create CSV from all movies
-    if let Err(e) = get_csv(&directories) {
+    if let Err(e) = get_csv(&directories, &config) {
         eprintln!("{}", e)
     }
 
@@ -88,33 +94,38 @@ fn main() {
     std::io::stdin().read_line(&mut String::new()).unwrap();
 }
 
-fn get_ratings() -> HashMap<String, String> {
-    let url = "https://letterboxd.com/equus497/films/";
+fn cfg_init() -> Config {
+    let data = std::fs::read_to_string("./config.toml")
+        .expect("Unable to read config file.");
+    toml::from_str(&data).unwrap()
+}
 
-    let req = reqwest::blocking::get(url).expect("Did not reach the server.");
-    let resp = req.text().unwrap();
-    let document = Document::from(resp.as_str());
+fn get_ratings(cfg: &Config) -> HashMap<String, String> {
+
+    let req = reqwest::blocking::get(&cfg.letterboxd).expect("Did not reach the server.");
+    let res = req.text().unwrap();
+    let doc = Document::from(res.as_str());
     
-    let page_count = document.find(Class("pagination"))
+    let pagination = doc.find(Class("pagination"))
         .into_selection()
         .first()
         .unwrap()
         .text();
 
-    let split = page_count
+    let split = pagination
         .trim()
         .rfind(" ")
         .unwrap();
 
-    let t = page_count.trim();
-    let p_count  = &t[split+1..];
+    let last_page = pagination.trim();
+    let p_count  = &last_page[split+1..];
 
     let p_total: usize = p_count.parse().unwrap();
 
     let page_links = (1..=p_total)
-        .map(|i| format!("https://letterboxd.com/equus497/films/page/{}", i))
+        .map(|i| format!("{}page/{i}", &cfg.letterboxd))
         .collect::<Vec<_>>();
-    // ! Create hashmap of {"title": "rating"}
+
     let mut catalogue = HashMap::new();
 
     for link in page_links{
@@ -134,20 +145,12 @@ fn get_ratings() -> HashMap<String, String> {
                 .to_string();
 
             let title = sanitize(raw_title);
-
             let rating = poster.text().trim().to_string();
 
             catalogue.insert(title, rating);
         }
     }
     catalogue
-}
-
-fn sanitize(mut str: String) -> String {
-    if str.contains(":"){
-        str = str.replace(":", " -");
-    }
-    str
 }
 
 fn rename() -> Result<(), Box<dyn std::error::Error>> {
@@ -195,21 +198,26 @@ fn rename() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn get_csv(directories: &Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn get_csv(directories: &Vec<PathBuf>, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = csv::Writer::from_path("D:/Movies/movie_log.csv")?;
-    let ratings = get_ratings();
+    let ratings = get_ratings(&cfg);
     
     let r_titles = ratings.keys()
         .map(|x| x.as_str())
         .collect::<Vec<_>>();
 
-    for item in directories.iter() {
-        let f = std::fs::File::open(item).unwrap();
+    let mut pb = tqdm!(
+        total = directories.len(),
+            animation = "tqdm"
+    );
+
+    for movie in directories.iter() {
+        let f = std::fs::File::open(movie).unwrap();
         let matroska = Matroska::open(&f).unwrap();
 
         // ? GENERAL METADATA
         // Title
-        let file_title = item.to_str().unwrap();
+        let file_title = movie.to_str().unwrap();
         let paren1 = &file_title.find("(").unwrap();
         let title = String::from(&file_title[3..*paren1 - 1]);
 
@@ -219,11 +227,11 @@ fn get_csv(directories: &Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>>
         let year = year_str.parse::<i16>().unwrap();
 
         // Encoder & Remux status
-        let encoder = get_encoder(&file_title);
+        let encoder = get_encoder(&file_title, cfg);
         let remux = file_title.to_lowercase().contains("remux");
 
         // Size    » API returns number of bytes, must be converted
-        let byte_count = std::fs::metadata(item).unwrap().len();
+        let byte_count = std::fs::metadata(movie).unwrap().len();
         let size = human_readable(byte_count as f32).parse::<f32>().unwrap();
 
         // Duration
@@ -296,14 +304,18 @@ fn get_csv(directories: &Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>>
             encoder,
             remux,
         })?;
+
+        pb.update(1);
     }
 
+    pb.refresh();
+    eprint!("\n");
     writer.flush()?;
     Ok(())
 }
 
-fn get_encoder(title: &str) -> Option<String> {
-    let enc_list= vec!["Tigole", "FraMeSToR", "Silence", "afm72", "DDR", "Bandi", "SAMPA", "3xO", "Joy", "RARBG", "SARTRE", "PHOCiS", "TERMiNAL", "PSA", "K1tKat", "FreetheFish", "Natty", "IchtyFinger", "BeiTai", "LEGi0N", "HDH", "HANDS", "GREENOTEA", "IWFM", "FRDS", "Ritaj", "Enthwar", "t3nzin", "EDG"];
+fn get_encoder(title: &str, cfg: &Config) -> Option<String> {
+    let enc_list= &cfg.enc_list;
 
     for enc in enc_list {
         if title.contains(enc) {
@@ -331,88 +343,12 @@ fn human_readable(mut bytes: f32) -> String {
     format!("{:.2}", bytes)
 }
 
-// ? OLD PARSING FUNCTION
-// ?     Very similar to get_csv but returns vec<Movie>
-// let movie_info = parse(&directories);
-/*
-fn parse(directories: &Vec<PathBuf>) -> Vec<Movie> {
-
-    let mut movie_info = Vec::new();
-    for item in directories.iter() {
-
-        let f = std::fs::File::open(item).unwrap();
-        let matroska = Matroska::open(&f).unwrap();
-
-        // ? GENERAL METADATA
-        // Title
-        let file_title = item.to_str().unwrap();
-        let paren1 = &file_title.find("(").unwrap();
-        let title = &file_title[3..*paren1-1];
-
-        // Year
-        let paren2 = &file_title.find(")").unwrap();
-        let year_str = &file_title[*paren1+1..*paren2];
-        let year = year_str.parse::<i16>().unwrap();
-
-        // Size    » API returns number of bytes, must be converted
-        let byte_count = std::fs::metadata(item).unwrap().len();
-        let size = human_readable(byte_count as f32);
-
-        // Duration
-        let dur_secs = matroska.info.duration.unwrap();
-        let duration = get_dur(dur_secs);
-
-        // ? VIDEO METADATA
-
-        let vid_info = &matroska.tracks[0];
-
-        // Resolution
-        let res = match &vid_info.settings {
-            Video(n) if n.pixel_width > 1920 => "2160p",
-            Video(n) if n.pixel_width <= 1920 => "1080p",
-            _ => "9999p",
-        };
-
-        // Video Codec & Bit depth
-        let (v_codec, bit_depth) = match vid_info.codec_id.as_str() {
-            "V_MPEGH/ISO/HEVC" => ("x265", "10bit"),
-            "V_MPEG4/ISO/AVC" => ("x264", "8bit"),
-            _ => ("XXXXXXXXXX", "XXXXXXXXXX")
-        };
-
-        // ? AUDIO METADATA
-        // Audio codec
-        let aud_info = &matroska.tracks[1];
-
-        let a_codec = match aud_info.codec_id.as_str() {
-            "A_AAC" => "AAC",
-            "A_AC3" => "AC3",
-            "A_EAC3" => "EAC3",
-            "A_DTS" => "DTS",
-            "A_TRUEHD" => "TrueHD Atmos",
-            _ => "XXX",
-        };
-
-        // Audio Channels
-        let channels: f32 = match &aud_info.settings {
-            Audio(c) if c.channels == 8 => 7.1,
-            Audio(c) if c.channels == 7 => 6.1,
-            Audio(c) if c.channels == 6 => 5.1,
-            Audio(c) if c.channels == 4 => 4.0,
-            Audio(c) if c.channels == 2 => 2.0,
-            Audio(c) if c.channels == 0 => 1.0,
-            _ => 9.9,
-        };
-
-        movie_info.push(Movie {
-            title, year, size, duration, res, bit_depth, v_codec, a_codec, channels,
-        });
+fn sanitize(mut str: String) -> String {
+    if str.contains(":"){
+        str = str.replace(":", " -");
     }
-    movie_info
+    str
 }
-
-*/
-
 // ! Use to generate an example matroska type
 // let f = std::fs::File::open(&directories[99]).unwrap();
 // let matroska = Matroska::open(&f).unwrap();
