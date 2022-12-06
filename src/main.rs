@@ -1,16 +1,20 @@
+// ! Things to add
+//  1) Fix up user input sections.
+//  2) Refactor a lot of csv related code
+
 use csv;
-use reqwest;
+use kdam::{tqdm, BarExt};
 use matroska::{
     Matroska,
     Settings::{Audio, Video},
 };
-use kdam::{tqdm, BarExt};
+use reqwest;
+use select::document::Document;
+use select::predicate::{Attr, Class};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use walkdir::WalkDir;
-use select::document::Document;
-use select::predicate::{Class, Attr};
-use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -31,6 +35,7 @@ pub struct Movie {
     bit_depth: String,
     v_codec: String,
     a_codec: String,
+    subs: Option<String>,
     channels: String,
     encoder: Option<String>,
     remux: bool,
@@ -56,11 +61,11 @@ fn main() {
         .max_depth(2)
         .into_iter()
         .filter_map(|file| file.ok())
-        {
-            if entry.file_name().to_string_lossy().ends_with(".mkv") {
-                directories.push(entry.path().to_owned());
-            }
+    {
+        if entry.file_name().to_string_lossy().ends_with(".mkv") {
+            directories.push(entry.path().to_owned());
         }
+    }
 
     // Create CSV from all movies
     if let Err(e) = get_csv(&directories, &config) {
@@ -95,30 +100,26 @@ fn main() {
 }
 
 fn cfg_init() -> Config {
-    let data = std::fs::read_to_string("./config.toml")
-        .expect("Unable to read config file.");
+    let data = std::fs::read_to_string("./config.toml").expect("Unable to read config file.");
     toml::from_str(&data).unwrap()
 }
 
 fn get_ratings(cfg: &Config) -> HashMap<String, String> {
-
     let req = reqwest::blocking::get(&cfg.letterboxd).expect("Did not reach the server.");
     let res = req.text().unwrap();
     let doc = Document::from(res.as_str());
-    
-    let pagination = doc.find(Class("pagination"))
+
+    let pagination = doc
+        .find(Class("pagination"))
         .into_selection()
         .first()
         .unwrap()
         .text();
 
-    let split = pagination
-        .trim()
-        .rfind(" ")
-        .unwrap();
+    let split = pagination.trim().rfind(" ").unwrap();
 
     let last_page = pagination.trim();
-    let p_count  = &last_page[split+1..];
+    let p_count = &last_page[split + 1..];
 
     let p_total: usize = p_count.parse().unwrap();
 
@@ -128,15 +129,14 @@ fn get_ratings(cfg: &Config) -> HashMap<String, String> {
 
     let mut catalogue = HashMap::new();
 
-    for link in page_links{
-
+    for link in page_links {
         let req = reqwest::blocking::get(link).expect("Did not reach the server.");
         let resp = req.text().unwrap();
         let cur_page = Document::from(resp.as_str());
 
         for poster in cur_page.find(Class("poster-container")) {
-            
-            let raw_title = poster.find(Attr("alt", ()))
+            let raw_title = poster
+                .find(Attr("alt", ()))
                 .into_selection()
                 .first()
                 .unwrap()
@@ -201,15 +201,12 @@ fn rename() -> Result<(), Box<dyn std::error::Error>> {
 fn get_csv(directories: &Vec<PathBuf>, cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = csv::Writer::from_path("D:/Movies/movie_log.csv")?;
     let ratings = get_ratings(&cfg);
-    
-    let r_titles = ratings.keys()
-        .map(|x| x.as_str())
-        .collect::<Vec<_>>();
 
-    let mut pb = tqdm!(
-        total = directories.len(),
-            animation = "tqdm"
-    );
+    let r_titles = ratings.keys().map(|x| x.as_str()).collect::<Vec<_>>();
+
+    println!("Logging titles...");
+
+    let mut pb = tqdm!(total = directories.len(), animation = "tqdm");
 
     for movie in directories.iter() {
         let f = std::fs::File::open(movie).unwrap();
@@ -243,11 +240,13 @@ fn get_csv(directories: &Vec<PathBuf>, cfg: &Config) -> Result<(), Box<dyn std::
 
         let rating = match get_rating.len() {
             0 => None,
-            _ => ratings.get(get_rating[0]).cloned()
+            _ => ratings.get(get_rating[0]).cloned(),
         };
 
+        let tracks = &matroska.tracks;
+
         // ? VIDEO METADATA
-        let vid_info = &matroska.tracks[0];
+        let vid_info = &tracks[0];
 
         // Resolution
         let res: i16 = match &vid_info.settings {
@@ -266,7 +265,7 @@ fn get_csv(directories: &Vec<PathBuf>, cfg: &Config) -> Result<(), Box<dyn std::
 
         // ? AUDIO METADATA
         // Audio codec
-        let aud_info = &matroska.tracks[1];
+        let aud_info = &tracks[1];
 
         let a_codec = match aud_info.codec_id.as_str() {
             "A_AAC" => "AAC",
@@ -290,6 +289,32 @@ fn get_csv(directories: &Vec<PathBuf>, cfg: &Config) -> Result<(), Box<dyn std::
         }
         .to_string();
 
+        // Subtitles
+        let mut idx = 0;
+        let mut has_subs = false;
+        for t in tracks {
+            match t.tracktype {
+                matroska::Tracktype::Subtitle => {
+                    has_subs = true;
+                    break;
+                }
+                _ => idx += 1,
+            };
+        }
+
+        let subs_data = match has_subs {
+            true => &tracks[idx].codec_id,
+            false => "None",
+        };
+
+        let subs: Option<String> = match subs_data {
+            "S_VOBSUB" => Some("VOB".to_string()),
+            "S_TEXT/UTF8" => Some("SRT".to_string()),
+            "S_HDMV/PGS" => Some("PGS".to_string()),
+            "S_TEXT/ASS" => Some("SSA".to_string()),
+            _ => None,
+        };
+
         writer.serialize(Movie {
             title,
             year,
@@ -301,6 +326,7 @@ fn get_csv(directories: &Vec<PathBuf>, cfg: &Config) -> Result<(), Box<dyn std::
             v_codec,
             a_codec,
             channels,
+            subs,
             encoder,
             remux,
         })?;
@@ -315,7 +341,7 @@ fn get_csv(directories: &Vec<PathBuf>, cfg: &Config) -> Result<(), Box<dyn std::
 }
 
 fn get_encoder(title: &str, cfg: &Config) -> Option<String> {
-    let enc_list= &cfg.enc_list;
+    let enc_list = &cfg.enc_list;
 
     for enc in enc_list {
         if title.contains(enc) {
@@ -344,7 +370,7 @@ fn human_readable(mut bytes: f32) -> String {
 }
 
 fn sanitize(mut str: String) -> String {
-    if str.contains(":"){
+    if str.contains(":") {
         str = str.replace(":", " -");
     }
     str
